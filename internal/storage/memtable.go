@@ -74,6 +74,25 @@ func (m *Memtable) Len() int {
 	return n
 }
 
+// All returns a copy of every buffered point, across all series. Used for flushing
+func (m *Memtable) All() []Point {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var out []Point
+	for _, pts := range m.points {
+		out = append(out, pts...)
+	}
+	return out
+}
+
+// Clear empties the memtable. Used right after a succesful flush to disk
+func (m *Memtable) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.points = make(map[string][]Point)
+}
+
 // SeriesNames returns the distinct series names currently buffered in the memtable.
 func (m *Memtable) SeriesNames() []string {
 	m.mu.RLock()
