@@ -1,0 +1,247 @@
+// Package engine wires together the WAL (robustness), the memtable/logstore
+// (fast in-memory query), and segments (bounded-memory durable storage) into
+// one coherent store. This is the "database" layer that cmd/server talks to.
+package engine
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+
+	"homelab-tsdb/internal/storage"
+	"homelab-tsdb/internal/wal"
+)
+
+type Engine struct {
+	mu sync.Mutex
+
+	dataDir string
+	segDir  string
+	walPath string
+
+	w   *wal.WAL
+	mem *storage.Memtable
+	log *storage.LogStore
+
+	coldPoints []storage.Point
+	coldLogs   []storage.LogEntry
+
+	flushThreshold int
+}
+
+// Open creates dataDir if needed, replays any existing WAL (crash recovery),
+// loads any existing segment files, and returns a ready-to-use Engine.
+func Open(dataDir string, flushThreshold int) (*Engine, error) {
+	segDir := filepath.Join(dataDir, "segments")
+	if err := os.MkdirAll(segDir, 0o755); err != nil {
+		return nil, fmt.Errorf("engine: create segments dir: %w", err)
+	}
+
+	e := &Engine{
+		dataDir:        dataDir,
+		segDir:         segDir,
+		walPath:        filepath.Join(dataDir, "current.wal"),
+		mem:            storage.NewMemtable(),
+		log:            storage.NewLogStore(),
+		flushThreshold: flushThreshold,
+	}
+
+	err := wal.Replay(e.walPath, func(payload []byte) error {
+		kind, point, entry, err := storage.Unwrap(payload)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case storage.KindPoint:
+			e.mem.Put(point)
+		case storage.KindLog:
+			e.log.Put(entry)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("engine: wal replay: %w", err)
+	}
+
+	if err := e.loadSegments(); err != nil {
+		return nil, fmt.Errorf("engine: load segments: %w", err)
+	}
+
+	w, err := wal.Open(e.walPath)
+	if err != nil {
+		return nil, fmt.Errorf("engine: open wal: %w", err)
+	}
+	e.w = w
+
+	return e, nil
+}
+
+func (e *Engine) loadSegments() error {
+	entries, err := os.ReadDir(e.segDir)
+	if err != nil {
+		return err
+	}
+
+	var names []string
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			names = append(names, ent.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		seg, err := storage.ReadSegment(filepath.Join(e.segDir, name))
+		if err != nil {
+			return fmt.Errorf("segment %s: %w", name, err)
+		}
+		e.coldPoints = append(e.coldPoints, seg.Points...)
+		e.coldLogs = append(e.coldLogs, seg.Logs...)
+	}
+	return nil
+}
+
+// WriteMetric durably logs and buffers one metric point.
+func (e *Engine) WriteMetric(p storage.Point) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if p.Timestamp == 0 {
+		p.Timestamp = time.Now().UnixNano()
+	}
+	if err := e.w.Append(storage.WrapPoint(p)); err != nil {
+		return err
+	}
+	e.mem.Put(p)
+	return e.maybeFlushLocked()
+}
+
+// WriteLog durably logs and buffers one log entry.
+func (e *Engine) WriteLog(l storage.LogEntry) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if l.Timestamp == 0 {
+		l.Timestamp = time.Now().UnixNano()
+	}
+	if err := e.w.Append(storage.WrapLog(l)); err != nil {
+		return err
+	}
+	e.log.Put(l)
+	return e.maybeFlushLocked()
+}
+
+// QueryMetrics returns points for a series across both cold (flushed) and
+// hot (in-memory) data, merged and time-ordered.
+func (e *Engine) QueryMetrics(series string, start, end int64) []storage.Point {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if end == 0 {
+		end = time.Now().Add(24 * time.Hour).UnixNano()
+	}
+
+	var out []storage.Point
+	for _, p := range e.coldPoints {
+		if p.Series == series && p.Timestamp >= start && p.Timestamp <= end {
+			out = append(out, p)
+		}
+	}
+	out = append(out, e.mem.Range(series, start, end)...)
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
+	return out
+}
+
+// QueryLogs returns log entries matching q across both cold and hot data,
+// newest first, capped at limit.
+func (e *Engine) QueryLogs(q storage.LogQuery, limit int) []storage.LogEntry {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	hot := e.log.Query(q, 0)
+
+	var cold []storage.LogEntry
+	for i := len(e.coldLogs) - 1; i >= 0; i-- {
+		l := e.coldLogs[i]
+		if l.Timestamp < q.Start {
+			continue
+		}
+		if q.End != 0 && l.Timestamp > q.End {
+			continue
+		}
+		if q.Source != "" && l.Source != q.Source {
+			continue
+		}
+		if q.Level != "" && l.Level != q.Level {
+			continue
+		}
+		cold = append(cold, l)
+	}
+
+	merged := append(hot, cold...)
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Timestamp > merged[j].Timestamp })
+
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
+}
+
+// maybeFlushLocked flushes to a segment if the hot buffers have grown past
+// the threshold. Caller must hold e.mu.
+func (e *Engine) maybeFlushLocked() error {
+	if e.mem.Len()+e.log.Len() < e.flushThreshold {
+		return nil
+	}
+	return e.flushLocked()
+}
+
+// Flush forces an immediate flush regardless of buffer size.
+func (e *Engine) Flush() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.flushLocked()
+}
+
+func (e *Engine) flushLocked() error {
+	points := e.mem.All()
+	logs := e.log.All()
+	if len(points) == 0 && len(logs) == 0 {
+		return nil
+	}
+
+	segPath := filepath.Join(e.segDir, fmt.Sprintf("seg-%020d.seg", time.Now().UnixNano()))
+	if err := storage.WriteSegment(segPath, storage.Segment{Points: points, Logs: logs}); err != nil {
+		return fmt.Errorf("engine: flush: %w", err)
+	}
+
+	e.coldPoints = append(e.coldPoints, points...)
+	e.coldLogs = append(e.coldLogs, logs...)
+	e.mem.Clear()
+	e.log.Clear()
+
+	if err := e.w.Close(); err != nil {
+		return fmt.Errorf("engine: close wal before reset: %w", err)
+	}
+	if err := os.Truncate(e.walPath, 0); err != nil {
+		return fmt.Errorf("engine: truncate wal: %w", err)
+	}
+	w, err := wal.Open(e.walPath)
+	if err != nil {
+		return fmt.Errorf("engine: reopen wal: %w", err)
+	}
+	e.w = w
+
+	return nil
+}
+
+// Close flushes and closes the engine cleanly.
+func (e *Engine) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.w.Close()
+}
