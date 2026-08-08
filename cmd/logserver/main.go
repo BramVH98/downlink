@@ -1,35 +1,25 @@
-/*
-Command logserver is a simple self-hosted log and event server built
-entirely on the custom WAL/engine storage layer: batched http ingestion
-structured fields, filtered queries, a filtered query API, live tail over SSE, singe-page web UI, and operational basics
-*/
-/*
-Command logserver is a simple self-hosted log and event server built
-entirely on the custom WAL/engine storage layer: batched http ingestion
-structured fields, filtered queries, a filtered query API, live tail over SSE, singe-page web UI, and operational basics
-*/
+// Command logserver is a simple self-hosted log and event server built
+// entirely on the custom WAL/engine storage layer: batched HTTP ingestion
+// with structured fields, a filtered query API, live tail over SSE, a
+// single-page web UI, and operational basics (retention+compaction, basic
+// auth, ingest tokens, syslog receiver, config file, graceful shutdown).
 package main
 
 import (
 	"bufio"
-	"crypto/subtle"
-	"encoding/csv"
-	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os"
+	"os/signal"
 	"strconv"
 	"strings"
-	"time"
-	"strings"
+	"syscall"
 	"time"
 
 	"homelab-tsdb/internal/engine"
@@ -52,7 +42,6 @@ func main() {
 	syslogAddr := flag.String("syslog-addr", "", "UDP address to receive syslog on (e.g. ':5514'); empty disables it. Syslog has no auth, so use -syslog-allow too")
 	syslogAllow := flag.String("syslog-allow", "", "comma-separated IPs/CIDRs allowed to send syslog (e.g. '192.168.1.0/24'); empty means allow from anywhere - not recommended")
 	flag.Parse()
-	flag.Parse()
 
 	if *configFile != "" {
 		if err := applyConfigFile(*configFile); err != nil {
@@ -64,11 +53,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("open engine: %v", err)
 	}
-	defer eng.Close()
 
 	if *authUser == "" {
 		log.Printf("WARNING: no -auth-user set, running with NO authentication.")
 	}
+
 	tokens, err := parseIngestTokens(*ingestTokens)
 	if err != nil {
 		log.Fatalf("parse ingest tokens: %v", err)
@@ -118,19 +107,35 @@ func main() {
 	mux.HandleFunc("GET /export/logs", handleExportLogs(eng))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /", handleUI())
-	mux.HandleFunc("POST /logs", handleIngestLogs(eng, broadcaster))
-	mux.HandleFunc("GET /logs", handleQueryLogs(eng))
-	mux.HandleFunc("GET /tail", handleTail(broadcaster))
-	mux.HandleFunc("GET /services", handleServices(eng))
-	mux.HandleFunc("GET /stats", handleStats(eng))
-	mux.HandleFunc("GET /export/logs", handleExportLogs(eng))
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("GET /", handleUI())
 
 	handler := withAuth(*authUser, *authPass, tokens, mux)
 
+	server := &http.Server{Addr: *addr, Handler: handler}
+
+	shutdownComplete := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		sig := <-sigCh
+		log.Printf("received %s, shutting down gracefully...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		if err := eng.Close(); err != nil {
+			log.Printf("engine close: %v", err)
+		}
+		close(shutdownComplete)
+	}()
+
 	log.Printf("homelab-tsdb logserver listening on %s (data: %s, retention: %s)", *addr, *dataDir, *retention)
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %v", err)
+	}
+	<-shutdownComplete
+	log.Println("shutdown complete")
 }
 
 // --- config file ---
@@ -192,8 +197,6 @@ func parseConfigFile(path string) (map[string]string, error) {
 	}
 	return values, nil
 }
-
-// --- auth ---
 
 // --- auth ---
 //
@@ -330,34 +333,7 @@ func parseTimestamp(raw json.RawMessage) (int64, error) {
 }
 
 func handleIngestLogs(eng *engine.Engine, broadcaster *tail.Broadcaster[storage.LogEntry]) http.HandlerFunc {
-func parseTimestamp(raw json.RawMessage) (int64, error) {
-	if len(raw) == 0 {
-		return time.Now().UnixNano(), nil
-	}
-
-	var asMillis int64
-	if err := json.Unmarshal(raw, &asMillis); err == nil {
-		return asMillis * int64(time.Millisecond), nil
-	}
-
-	var asString string
-	if err := json.Unmarshal(raw, &asString); err == nil {
-		if t, err := time.Parse(time.RFC3339Nano, asString); err == nil {
-			return t.UnixNano(), nil
-		}
-		if t, err := time.Parse(time.RFC3339, asString); err == nil {
-			return t.UnixNano(), nil
-		}
-		return 0, fmt.Errorf("timestamp string %q is not valid RFC3339", asString)
-	}
-
-	return 0, fmt.Errorf("timestamp must be a unix-millis number or an RFC3339 string")
-}
-
-func handleIngestLogs(eng *engine.Engine, broadcaster *tail.Broadcaster[storage.LogEntry]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var raw json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		var raw json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
@@ -392,48 +368,6 @@ func handleIngestLogs(eng *engine.Engine, broadcaster *tail.Broadcaster[storage.
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-
-		var batch []ingestLogRequest
-		var single ingestLogRequest
-		if err := json.Unmarshal(raw, &batch); err != nil {
-			if err := json.Unmarshal(raw, &single); err != nil {
-				http.Error(w, "body must be a log object or an array of log objects: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-			batch = []ingestLogRequest{single}
-		}
-		if len(batch) == 0 {
-			http.Error(w, "empty batch", http.StatusBadRequest)
-			return
-		}
-
-		inserted := 0
-		for _, req := range batch {
-			if req.Service == "" || req.Message == "" {
-				http.Error(w, "each log requires service and message", http.StatusBadRequest)
-				return
-			}
-			if req.Level == "" {
-				req.Level = "info"
-			}
-			ts, err := parseTimestamp(req.Timestamp)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			entry := storage.LogEntry{
-				Timestamp: ts, Source: req.Service, Level: req.Level,
-				Message: req.Message, Fields: req.Fields,
-			}
-			stored, err := eng.WriteLog(entry)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			broadcaster.Publish(stored)
-			inserted++
-		}
 
 			entry := storage.LogEntry{
 				Timestamp: ts, Source: req.Service, Level: req.Level,
@@ -553,157 +487,12 @@ func handleStats(eng *engine.Engine) http.HandlerFunc {
 // --- live tail (SSE) ---
 
 func handleTail(broadcaster *tail.Broadcaster[storage.LogEntry]) http.HandlerFunc {
-		writeJSON(w, map[string]int{"inserted": inserted})
-	}
-}
-
-// --- query API ---
-
-func parseFieldParams(values []string) map[string]string {
-	out := make(map[string]string)
-	for _, v := range values {
-		parts := strings.SplitN(v, ":", 2)
-		if len(parts) == 2 {
-			out[parts[0]] = parts[1]
-		}
-	}
-	return out
-}
-
-func parseFieldParamsFloat(values []string) map[string]float64 {
-	raw := parseFieldParams(values)
-	out := make(map[string]float64, len(raw))
-	for k, v := range raw {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			out[k] = f
-		}
-	}
-	return out
-}
-
-func parseLogFilter(r *http.Request) (storage.LogQuery, int, int) {
-	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	startMillis, _ := strconv.ParseInt(q.Get("start"), 10, 64)
-	endMillis, _ := strconv.ParseInt(q.Get("end"), 10, 64)
-
-	filter := storage.LogQuery{
-		Source:   q.Get("service"),
-		Level:    q.Get("level"),
-		Contains: q.Get("contains"),
-		Start:    startMillis * int64(time.Millisecond),
-		FieldEq:  parseFieldParams(q["field"]),
-		FieldGT:  parseFieldParamsFloat(q["field_gt"]),
-		FieldLT:  parseFieldParamsFloat(q["field_lt"]),
-	}
-	if endMillis != 0 {
-		filter.End = endMillis * int64(time.Millisecond)
-	}
-	if limit <= 0 || limit > 1000 {
-		limit = 200
-	}
-	return filter, limit, offset
-}
-
-func handleQueryLogs(eng *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		filter, limit, offset := parseLogFilter(r)
-		rows := eng.QueryLogs(filter, limit, offset)
-
-		out := make([]logResponse, len(rows))
-		for i, row := range rows {
-			out[i] = toResponse(row)
-		}
-		writeJSON(w, out)
-	}
-}
-
-func handleServices(eng *engine.Engine) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, eng.ListServices())
-	}
-}
-
-type statsResponse struct {
-	TotalLogs   int64            `json:"total_logs"`
-	TotalEvents int64            `json:"total_events"`
-	ByLevel     []levelCountJSON `json:"by_level"`
-	ByService   []svcCountJSON   `json:"by_service"`
-}
-type levelCountJSON struct {
-	Level string `json:"level"`
-	Count int64  `json:"count"`
-}
-type svcCountJSON struct {
-	Service string `json:"service"`
-	Count   int64  `json:"count"`
-}
-
-func handleStats(eng *engine.Engine) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		st := eng.Stats()
-		resp := statsResponse{TotalLogs: st.TotalLogs, TotalEvents: st.TotalEvents}
-		for level, count := range st.ByLevel {
-			resp.ByLevel = append(resp.ByLevel, levelCountJSON{level, count})
-		}
-		for svc, count := range st.ByService {
-			resp.ByService = append(resp.ByService, svcCountJSON{svc, count})
-		}
-		writeJSON(w, resp)
-	}
-}
-
-// --- live tail (SSE) ---
-
-func handleTail(broadcaster *tail.Broadcaster[storage.LogEntry]) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-
-		ch, cancel := broadcaster.Subscribe()
-		defer cancel()
-
-		keepalive := time.NewTicker(15 * time.Second)
-		defer keepalive.Stop()
-
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case entry, ok := <-ch:
-				if !ok {
-					return
-				}
-				data, err := json.Marshal(toResponse(entry))
-				if err != nil {
-					continue
-				}
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
-			case <-keepalive.C:
-				fmt.Fprint(w, ": keepalive\n\n")
-				flusher.Flush()
-			}
-		}
-	}
-}
-
-// --- export ---
-
-func handleExportLogs(eng *engine.Engine) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -769,71 +558,22 @@ func handleExportLogs(eng *engine.Engine) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Disposition", `attachment; filename="logs-export.json"`)
 		writeJSON(w, out)
-		filter, _, _ := parseLogFilter(r)
-		rows := eng.QueryLogs(filter, 100000, 0)
-
-		if r.URL.Query().Get("format") == "csv" {
-			w.Header().Set("Content-Type", "text/csv")
-			w.Header().Set("Content-Disposition", `attachment; filename="logs-export.csv"`)
-			cw := csv.NewWriter(w)
-			cw.Write([]string{"id", "service", "level", "message", "fields", "ts"})
-			for _, row := range rows {
-				r := toResponse(row)
-				cw.Write([]string{
-					strconv.FormatInt(r.ID, 10), r.Service, r.Level, r.Message,
-					string(r.Fields), strconv.FormatInt(r.Ts, 10),
-				})
-			}
-			cw.Flush()
-			return
-		}
-
-		out := make([]logResponse, len(rows))
-		for i, row := range rows {
-			out[i] = toResponse(row)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Disposition", `attachment; filename="logs-export.json"`)
-		writeJSON(w, out)
 	}
 }
 
 // --- web UI ---
 
-// --- web UI ---
-
-func handleUI() http.HandlerFunc {
 func handleUI() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(webui.IndexHTML)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(webui.IndexHTML)
 	}
 }
 
-// --- retention / compaction ---
-
-func runRetentionLoop(eng *engine.Engine, retention, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		cutoff := time.Now().Add(-retention).UnixNano()
-		points, logs, err := eng.ApplyRetention(cutoff)
-		if err != nil {
-			log.Printf("retention sweep failed: %v", err)
-			continue
-		}
-		if points > 0 || logs > 0 {
-			log.Printf("retention+compaction: dropped %d points, %d logs older than %s", points, logs, retention)
-		}
-	}
 // --- retention / compaction ---
 
 func runRetentionLoop(eng *engine.Engine, retention, interval time.Duration) {
