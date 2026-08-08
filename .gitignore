@@ -1,0 +1,4 @@
+data/
+*.wal
+*.db
+/tmp/

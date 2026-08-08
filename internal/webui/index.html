@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>homelab-tsdb logserver</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161922; --border: #2a2f3a; --text: #e4e6ea;
+    --muted: #8a8f9c; --accent: #5b8def; --error: #e5534b; --warn: #d4a72c; --info: #4a9d5f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #3a3f4b; display: inline-block; margin-right: 5px; }
+  .live-dot.on { background: var(--info); box-shadow: 0 0 6px var(--info); }
+  .layout { display: grid; grid-template-columns: 220px 1fr; gap: 0; min-height: calc(100vh - 50px); }
+  aside { border-right: 1px solid var(--border); padding: 16px; }
+  main { padding: 16px 20px; }
+  .stat-block { margin-bottom: 20px; }
+  .stat-block h3 { font-size: 11px; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; letter-spacing: 0.5px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; }
+  .bar-label { width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .bar-track { flex: 1; background: #1e222c; border-radius: 3px; height: 14px; }
+  .bar-fill { background: var(--accent); height: 100%; border-radius: 3px; }
+  .bar-count { width: 36px; text-align: right; color: var(--muted); }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  input, select { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 4px; font-family: inherit; font-size: 12px; }
+  input[type="text"] { min-width: 200px; }
+  button { background: var(--accent); border: none; color: white; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { opacity: 0.9; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  td { padding: 6px 10px; border-bottom: 1px solid #1c1f27; vertical-align: top; }
+  tr.log-row { cursor: pointer; }
+  tr.log-row:hover td { background: #171a22; }
+  tr.fields-row td { background: #0c0e12; padding: 10px 10px 10px 30px; }
+  tr.fields-row pre { margin: 0; color: #9fb3d1; white-space: pre-wrap; }
+  .level { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .level-error { background: rgba(229,83,75,0.15); color: var(--error); }
+  .level-warn { background: rgba(212,167,44,0.15); color: var(--warn); }
+  .level-info { background: rgba(74,157,95,0.15); color: var(--info); }
+  .level-default { background: #262b36; color: var(--muted); }
+  .msg { color: var(--text); }
+  .ts { color: var(--muted); white-space: nowrap; }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 14px; }
+  .tab { padding: 6px 14px; border-radius: 4px; cursor: pointer; color: var(--muted); }
+  .tab.active { background: var(--panel); color: var(--text); }
+  .field-hint { color: var(--muted); font-size: 11px; }
+  tr.new-row { animation: flashIn 0.6s ease-out; }
+  @keyframes flashIn { from { background: rgba(91,141,239,0.25); } to { background: transparent; } }
+  .hidden-row { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>&#9679; homelab-tsdb logserver</h1>
+  <span id="refresh-status" style="color: var(--muted); font-size: 11px;"></span>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="stat-block">
+      <h3>By level</h3>
+      <div id="stats-level"></div>
+    </div>
+    <div class="stat-block">
+      <h3>By service</h3>
+      <div id="stats-service"></div>
+    </div>
+    <div class="stat-block">
+      <h3>Totals</h3>
+      <div id="stats-totals" style="color: var(--muted);"></div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-tab="logs">Logs</div>
+      <div class="tab" data-tab="live"><span class="live-dot" id="live-dot"></span>Live tail</div>
+    </div>
+
+    <div class="filters" id="filters-bar">
+      <select id="f-service"><option value="">All services</option></select>
+      <select id="f-level">
+        <option value="">All levels</option>
+        <option value="error">error</option>
+        <option value="warn">warn</option>
+        <option value="info">info</option>
+        <option value="debug">debug</option>
+      </select>
+      <input type="text" id="f-search" placeholder="Search message text...">
+      <input type="datetime-local" id="f-start" title="Start time">
+      <input type="datetime-local" id="f-end" title="End time">
+      <button onclick="loadData()">Filter</button>
+      <button onclick="exportData()" style="background: #3a3f4b;">Export JSON</button>
+    </div>
+    <div class="field-hint" id="field-hint" style="margin: -8px 0 12px;">
+      Structured field filters via the API: <code>?field=user:123</code>, <code>?field_gt=duration_ms:1000</code>
+    </div>
+
+    <table>
+      <thead id="table-head"><tr><th>Time</th><th>Service</th><th>Level</th><th>Message</th></tr></thead>
+      <tbody id="table-body"></tbody>
+    </table>
+    <div id="empty-msg" class="empty" style="display:none;">No results for these filters.</div>
+  </main>
+</div>
+
+<script>
+let currentTab = 'logs';
+let eventSource = null;
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentTab = tab.dataset.tab;
+    stopLiveTail();
+    document.getElementById('field-hint').style.display = currentTab === 'logs' ? 'block' : 'none';
+    if (currentTab === 'live') {
+      startLiveTail();
+    } else {
+      loadData();
+    }
+  });
+});
+
+function toMillis(datetimeLocalValue) {
+  if (!datetimeLocalValue) return '';
+  return new Date(datetimeLocalValue).getTime();
+}
+
+function buildQuery() {
+  const params = new URLSearchParams();
+  const service = document.getElementById('f-service').value;
+  const level = document.getElementById('f-level').value;
+  const search = document.getElementById('f-search').value;
+  const start = toMillis(document.getElementById('f-start').value);
+  const end = toMillis(document.getElementById('f-end').value);
+
+  if (service) params.set('service', service);
+  if (level) params.set('level', level);
+  if (search) params.set('contains', search);
+  if (start) params.set('start', start);
+  if (end) params.set('end', end);
+  params.set('limit', '200');
+  return params.toString();
+}
+
+async function loadServices() {
+  const res = await fetch('/services');
+  const services = await res.json();
+  const select = document.getElementById('f-service');
+  const current = select.value;
+  select.innerHTML = '<option value="">All services</option>' +
+    (services || []).map(s => `<option value="${s}">${s}</option>`).join('');
+  select.value = current;
+}
+
+async function loadStats() {
+  const res = await fetch('/stats');
+  const stats = await res.json();
+
+  const maxLevel = Math.max(1, ...(stats.by_level || []).map(l => l.count));
+  document.getElementById('stats-level').innerHTML = (stats.by_level || []).map(l => `
+    <div class="bar-row">
+      <span class="bar-label">${l.level}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${(l.count/maxLevel*100)}%"></div></div>
+      <span class="bar-count">${l.count}</span>
+    </div>`).join('') || '<span style="color:var(--muted)">No data yet</span>';
+
+  const maxSvc = Math.max(1, ...(stats.by_service || []).map(s => s.count));
+  document.getElementById('stats-service').innerHTML = (stats.by_service || []).map(s => `
+    <div class="bar-row">
+      <span class="bar-label">${s.service}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${(s.count/maxSvc*100)}%"></div></div>
+      <span class="bar-count">${s.count}</span>
+    </div>`).join('') || '<span style="color:var(--muted)">No data yet</span>';
+
+  document.getElementById('stats-totals').innerHTML = `${stats.total_logs} logs`;
+}
+
+function levelClass(level) {
+  if (level === 'error') return 'level-error';
+  if (level === 'warn') return 'level-warn';
+  if (level === 'info') return 'level-info';
+  return 'level-default';
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s || '';
+  return div.innerHTML;
+}
+
+function logRowHtml(r, extraClass) {
+  const fieldsPretty = (() => {
+    try { return JSON.stringify(JSON.parse(r.fields || '{}'), null, 2); }
+    catch { return r.fields || '{}'; }
+  })();
+  const rowId = 'log-' + r.id + '-' + Math.random().toString(36).slice(2, 7);
+  return `
+    <tr class="log-row ${extraClass||''}" onclick="document.getElementById('${rowId}').classList.toggle('hidden-row')">
+      <td class="ts">${new Date(r.ts).toLocaleString()}</td>
+      <td>${r.service}</td>
+      <td><span class="level ${levelClass(r.level)}">${r.level}</span></td>
+      <td class="msg">${escapeHtml(r.message)}</td>
+    </tr>
+    <tr class="fields-row hidden-row" id="${rowId}"><td colspan="4"><pre>${escapeHtml(fieldsPretty)}</pre></td></tr>`;
+}
+
+async function loadData() {
+  document.getElementById('refresh-status').textContent = 'loading...';
+  const res = await fetch('/logs?' + buildQuery());
+  const rows = await res.json() || [];
+
+  document.getElementById('table-body').innerHTML = rows.map(r => logRowHtml(r)).join('');
+  document.getElementById('empty-msg').style.display = rows.length === 0 ? 'block' : 'none';
+  document.getElementById('refresh-status').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+function startLiveTail() {
+  document.getElementById('filters-bar').style.opacity = '0.5';
+  document.getElementById('filters-bar').style.pointerEvents = 'none';
+  document.getElementById('field-hint').style.display = 'none';
+
+  document.getElementById('table-body').innerHTML = '';
+  document.getElementById('empty-msg').style.display = 'none';
+
+  const serviceFilter = document.getElementById('f-service').value;
+  const levelFilter = document.getElementById('f-level').value;
+
+  eventSource = new EventSource('/tail');
+  eventSource.onopen = () => document.getElementById('live-dot').classList.add('on');
+  eventSource.onerror = () => document.getElementById('live-dot').classList.remove('on');
+  eventSource.onmessage = (e) => {
+    const row = JSON.parse(e.data);
+    if (serviceFilter && row.service !== serviceFilter) return;
+    if (levelFilter && row.level !== levelFilter) return;
+
+    const body = document.getElementById('table-body');
+    body.insertAdjacentHTML('afterbegin', logRowHtml(row, 'new-row'));
+    while (body.querySelectorAll('tr.log-row').length > 300) {
+      body.removeChild(body.lastElementChild);
+      body.removeChild(body.lastElementChild);
+    }
+  };
+}
+
+function stopLiveTail() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  document.getElementById('live-dot').classList.remove('on');
+  document.getElementById('filters-bar').style.opacity = '1';
+  document.getElementById('filters-bar').style.pointerEvents = 'auto';
+}
+
+function exportData() {
+  window.location.href = '/export/logs?' + buildQuery();
+}
+
+loadServices();
+loadStats();
+loadData();
+setInterval(() => {
+  loadServices();
+  loadStats();
+  if (currentTab !== 'live') loadData();
+}, 10000);
+</script>
+</body>
+</html>
