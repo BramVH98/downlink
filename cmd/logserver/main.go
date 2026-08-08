@@ -1,12 +1,13 @@
-/*
-Command logserver is a simple self-hosted log and event server built
-entirely on the custom WAL/engine storage layer: batched http ingestion
-structured fields, filtered queries, a filtered query API, live tail over SSE, singe-page web UI, and operational basics
-*/
+// Command logserver is a simple self-hosted log and event server built
+// entirely on the custom WAL/engine storage layer: batched HTTP ingestion
+// with structured fields, a filtered query API, live tail over SSE, a
+// single-page web UI, and operational basics (retention+compaction, basic
+// auth, ingest tokens, syslog receiver, config file, graceful shutdown).
 package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
@@ -15,12 +16,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"homelab-tsdb/internal/engine"
 	"homelab-tsdb/internal/storage"
+	"homelab-tsdb/internal/syslogrecv"
 	"homelab-tsdb/internal/tail"
 	"homelab-tsdb/internal/webui"
 )
@@ -34,6 +38,9 @@ func main() {
 	retention := flag.Duration("retention", 30*24*time.Hour, "how long to keep data before it's dropped")
 	retentionCheck := flag.Duration("retention-check", 1*time.Hour, "how often to run the retention+compaction sweep")
 	configFile := flag.String("config", "", "path to a config file (key = value per line, # for comments); any flag also passed on the command line overrides the matching config file value")
+	ingestTokens := flag.String("ingest-tokens", "", "comma-separated name:token pairs for collectors (e.g. 'apache:abc123,nginx:xyz789'); a valid token can only write logs, never read/export")
+	syslogAddr := flag.String("syslog-addr", "", "UDP address to receive syslog on (e.g. ':5514'); empty disables it. Syslog has no auth, so use -syslog-allow too")
+	syslogAllow := flag.String("syslog-allow", "", "comma-separated IPs/CIDRs allowed to send syslog (e.g. '192.168.1.0/24'); empty means allow from anywhere - not recommended")
 	flag.Parse()
 
 	if *configFile != "" {
@@ -46,15 +53,50 @@ func main() {
 	if err != nil {
 		log.Fatalf("open engine: %v", err)
 	}
-	defer eng.Close()
 
 	if *authUser == "" {
 		log.Printf("WARNING: no -auth-user set, running with NO authentication.")
 	}
 
+	tokens, err := parseIngestTokens(*ingestTokens)
+	if err != nil {
+		log.Fatalf("parse ingest tokens: %v", err)
+	}
+	for name := range tokens {
+		log.Printf("ingest token registered for collector %q", name)
+	}
+
 	broadcaster := tail.New[storage.LogEntry]()
 
 	go runRetentionLoop(eng, *retention, *retentionCheck)
+
+	if *syslogAddr != "" {
+		allow := strings.Split(*syslogAllow, ",")
+		go func() {
+			err := syslogrecv.Listen(*syslogAddr, allow, func(msg syslogrecv.Message) {
+				fieldsJSON, _ := json.Marshal(map[string]string{
+					"host": msg.Host,
+					"tag":  msg.Tag,
+				})
+				entry := storage.LogEntry{
+					Timestamp: msg.Timestamp.UnixNano(),
+					Source:    msg.Host,
+					Level:     msg.Severity,
+					Message:   msg.Message,
+					Fields:    fieldsJSON,
+				}
+				stored, err := eng.WriteLog(entry)
+				if err != nil {
+					log.Printf("syslog: write failed: %v", err)
+					return
+				}
+				broadcaster.Publish(stored)
+			})
+			if err != nil {
+				log.Fatalf("syslog listener: %v", err)
+			}
+		}()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /logs", handleIngestLogs(eng, broadcaster))
@@ -66,10 +108,34 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /", handleUI())
 
-	handler := withBasicAuth(*authUser, *authPass, mux)
+	handler := withAuth(*authUser, *authPass, tokens, mux)
+
+	server := &http.Server{Addr: *addr, Handler: handler}
+
+	shutdownComplete := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		sig := <-sigCh
+		log.Printf("received %s, shutting down gracefully...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		if err := eng.Close(); err != nil {
+			log.Printf("engine close: %v", err)
+		}
+		close(shutdownComplete)
+	}()
 
 	log.Printf("homelab-tsdb logserver listening on %s (data: %s, retention: %s)", *addr, *dataDir, *retention)
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %v", err)
+	}
+	<-shutdownComplete
+	log.Println("shutdown complete")
 }
 
 // --- config file ---
@@ -133,19 +199,37 @@ func parseConfigFile(path string) (map[string]string, error) {
 }
 
 // --- auth ---
-
-func withBasicAuth(user, pass string, next http.Handler) http.Handler {
-	if user == "" {
-		return next
-	}
+//
+// Two separate credential types, deliberately not interchangeable:
+//   - The admin user/pass unlocks everything: reading, exporting, and the
+//     dashboard.
+//   - A collector token unlocks nothing except POSTing to /logs or /events.
+//     A leaked or misconfigured token can never be used to read data back,
+//     export it, or view the dashboard - it's write-only by construction,
+//     not just by convention.
+func withAuth(adminUser, adminPass string, ingestTokens map[string]string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
+
+		isIngestRoute := r.Method == http.MethodPost && (r.URL.Path == "/logs" || r.URL.Path == "/events")
+		if isIngestRoute && len(ingestTokens) > 0 {
+			if _, ok := checkBearerToken(r, ingestTokens); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		if adminUser == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		gotUser, gotPass, ok := r.BasicAuth()
-		userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(user)) == 1
-		passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(pass)) == 1
+		userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(adminUser)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(adminPass)) == 1
 		if !ok || !userOK || !passOK {
 			w.Header().Set("WWW-Authenticate", `Basic realm="homelab-tsdb"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -153,6 +237,43 @@ func withBasicAuth(user, pass string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func checkBearerToken(r *http.Request, tokens map[string]string) (name string, ok bool) {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	given := strings.TrimPrefix(header, prefix)
+
+	for collectorName, token := range tokens {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(given)) == 1 {
+			return collectorName, true
+		}
+	}
+	return "", false
+}
+
+func parseIngestTokens(raw string) (map[string]string, error) {
+	tokens := make(map[string]string)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return tokens, nil
+	}
+
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid ingest token entry %q, expected 'name:token'", pair)
+		}
+		tokens[parts[0]] = parts[1]
+	}
+	return tokens, nil
 }
 
 // --- API response shape ---
