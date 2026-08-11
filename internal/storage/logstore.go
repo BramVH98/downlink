@@ -61,7 +61,10 @@ func (q LogQuery) MatchesEntry(e LogEntry) bool {
 	if q.End != 0 && e.Timestamp > q.End {
 		return false
 	}
-	if q.Source != "" && e.Level != q.Level {
+	if q.Level != "" && e.Level != q.Level {
+		return false
+	}
+	if q.Source != "" && e.Source != q.Source {
 		return false
 	}
 	if q.Contains != "" && !strings.Contains(strings.ToLower(e.Message), strings.ToLower(q.Contains)) {
