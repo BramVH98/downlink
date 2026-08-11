@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 )
 
@@ -56,12 +57,12 @@ func DecodePoint(data []byte) (Point, error) {
 
 	readString := func() (string, error) {
 		var lenBuf [2]byte
-		if _, err := r.Read(lenBuf[:]); err != nil {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			return "", err
 		}
 		n := binary.BigEndian.Uint16(lenBuf[:])
 		strBuf := make([]byte, n)
-		if _, err := r.Read(strBuf); err != nil {
+		if _, err := io.ReadFull(r, strBuf); err != nil {
 			return "", err
 		}
 		return string(strBuf), nil
@@ -73,7 +74,7 @@ func DecodePoint(data []byte) (Point, error) {
 	}
 
 	var tagCountBuf [2]byte
-	if _, err := r.Read(tagCountBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, tagCountBuf[:]); err != nil {
 		return Point{}, fmt.Errorf("decode tag count: %w", err)
 	}
 	tagCount := binary.BigEndian.Uint16(tagCountBuf[:])
@@ -92,13 +93,13 @@ func DecodePoint(data []byte) (Point, error) {
 	}
 
 	var tsBuf [8]byte
-	if _, err := r.Read(tsBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, tsBuf[:]); err != nil {
 		return Point{}, fmt.Errorf("decode timestamp: %w", err)
 	}
 	timestamp := int64(binary.BigEndian.Uint64(tsBuf[:]))
 
 	var valBuf [8]byte
-	if _, err := r.Read(valBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, valBuf[:]); err != nil {
 		return Point{}, fmt.Errorf("decode value: %w", err)
 	}
 	value := math.Float64frombits(binary.BigEndian.Uint64(valBuf[:]))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 /*
@@ -68,37 +69,37 @@ func DecodeLogEntry(data []byte) (LogEntry, error) {
 
 	readString := func() (string, error) {
 		var lenBuf [4]byte
-		if _, err := r.Read(lenBuf[:]); err != nil {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			return "", err
 		}
 		n := binary.BigEndian.Uint32(lenBuf[:])
 		strBuf := make([]byte, n)
-		if _, err := r.Read(strBuf); err != nil {
+		if _, err := io.ReadFull(r, strBuf); err != nil {
 			return "", err
 		}
 		return string(strBuf), nil
 	}
 	readBytes := func() ([]byte, error) {
 		var lenBuf [4]byte
-		if _, err := r.Read(lenBuf[:]); err != nil {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			return nil, err
 		}
 		n := binary.BigEndian.Uint32(lenBuf[:])
 		b := make([]byte, n)
-		if _, err := r.Read(b); err != nil {
+		if _, err := io.ReadFull(r, b); err != nil {
 			return nil, err
 		}
 		return b, nil
 	}
 
 	var idBuf [8]byte
-	if _, err := r.Read(idBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, idBuf[:]); err != nil {
 		return LogEntry{}, fmt.Errorf("decode id: %w", err)
 	}
 	id := int64(binary.BigEndian.Uint64(idBuf[:]))
 
 	var tsBuf [8]byte
-	if _, err := r.Read(tsBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, tsBuf[:]); err != nil {
 		return LogEntry{}, fmt.Errorf("decode timestamp: %w", err)
 	}
 	timestamp := int64(binary.BigEndian.Uint64(tsBuf[:]))
