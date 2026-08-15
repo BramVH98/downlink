@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # homelab-tsdb install script.
 #
-# There's no release pipeline yet, so this builds from source rather than
-# downloading a prebuilt binary - Go gets installed via apt if it's missing.
-# Once GitHub releases exist, swap the build step for a binary download;
-# the detection/systemd/config logic below doesn't need to change.
+# Tries to download a prebuilt binary from the latest GitHub Release first
+# (fast, no Go toolchain needed on the target machine). Falls back to
+# building from source if there's no matching release, the architecture
+# isn't one we build for, or GitHub's API is unreachable/rate-limited.
+#
+# The one thing that does NOT fall back silently: a checksum mismatch. That
+# can mean tampering, not just "no release available" - so it's a hard
+# failure, not a soft one.
 set -euo pipefail
 
-REPO_URL="${HOMELAB_TSDB_REPO:-https://github.com/BramVH98/homelab-tsdb.git}"
+REPO="BramVH98/homelab-tsdb"
+REPO_URL="https://github.com/${REPO}.git"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="homelab-tsdb-logserver"
 CONFIG_DIR="/etc/homelab-tsdb"
@@ -30,23 +35,104 @@ fi
 bold "homelab-tsdb installer"
 echo ""
 
-# --- 1. Ensure Go is available ---
-if ! command -v go >/dev/null 2>&1; then
-    echo "Go not found - installing via apt..."
-    apt-get update -qq
-    apt-get install -y -qq golang-go
+# --- 1. Figure out this machine's architecture, in release-asset terms ---
+ARCH_SUFFIX=""
+case "$(uname -m)" in
+    x86_64)  ARCH_SUFFIX="linux-amd64" ;;
+    aarch64|arm64) ARCH_SUFFIX="linux-arm64" ;;
+    armv7l)  ARCH_SUFFIX="linux-armv7" ;;
+    *)       ARCH_SUFFIX="" ;;  # covers armv6l (Pi Zero/1) and anything else - no prebuilt binary exists for these
+esac
+
+# --- 2. Try to fetch a prebuilt release binary ---
+INSTALLED_FROM_RELEASE=false
+
+if [ -n "$ARCH_SUFFIX" ]; then
+    echo "Checking for a prebuilt release ($ARCH_SUFFIX)..."
+
+    RELEASE_JSON="$BUILD_DIR/release.json"
+    if curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" -o "$RELEASE_JSON" 2>/dev/null; then
+        ASSET_NAME="${BINARY_NAME}-${ARCH_SUFFIX}"
+
+        BINARY_URL="$(python3 -c "
+import json, sys
+try:
+    with open('$RELEASE_JSON') as f:
+        data = json.load(f)
+    for asset in data.get('assets', []):
+        if asset['name'] == '$ASSET_NAME':
+            print(asset['browser_download_url'])
+            sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+" 2>/dev/null)" || BINARY_URL=""
+
+        CHECKSUMS_URL="$(python3 -c "
+import json, sys
+try:
+    with open('$RELEASE_JSON') as f:
+        data = json.load(f)
+    for asset in data.get('assets', []):
+        if asset['name'] == 'checksums.txt':
+            print(asset['browser_download_url'])
+            sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+" 2>/dev/null)" || CHECKSUMS_URL=""
+
+        if [ -n "$BINARY_URL" ] && [ -n "$CHECKSUMS_URL" ]; then
+            echo "Downloading $ASSET_NAME..."
+            curl -fsSL "$BINARY_URL" -o "$BUILD_DIR/$ASSET_NAME"
+            curl -fsSL "$CHECKSUMS_URL" -o "$BUILD_DIR/checksums.txt"
+
+            echo "Verifying checksum..."
+            if (cd "$BUILD_DIR" && sha256sum -c checksums.txt --ignore-missing) >/dev/null 2>&1; then
+                install -m 755 "$BUILD_DIR/$ASSET_NAME" "$INSTALL_DIR/$BINARY_NAME"
+                INSTALLED_FROM_RELEASE=true
+                echo "Installed prebuilt binary (checksum verified)."
+            else
+                # Do NOT fall back silently here - a checksum mismatch can
+                # mean a corrupted download or actual tampering, and quietly
+                # working around it would hide exactly the thing that
+                # matters most to catch.
+                echo ""
+                echo "ERROR: checksum verification failed for the downloaded binary."
+                echo "This could mean a corrupted download or a tampered file - not proceeding."
+                echo "Re-run the installer, and if this keeps happening, check the release page directly:"
+                echo "  https://github.com/${REPO}/releases"
+                exit 1
+            fi
+        else
+            echo "No matching release asset found - will build from source instead."
+        fi
+    else
+        echo "Could not reach GitHub's release API (rate-limited or offline) - will build from source instead."
+    fi
+else
+    echo "No prebuilt binary for this architecture ($(uname -m)) - will build from source instead."
 fi
 
-# --- 2. Get the source and build ---
-echo "Fetching source..."
-git clone --quiet --depth 1 "$REPO_URL" "$BUILD_DIR/src"
-cd "$BUILD_DIR/src"
+# --- 3. Fall back to building from source if we didn't install a release ---
+if [ "$INSTALLED_FROM_RELEASE" = false ]; then
+    if ! command -v go >/dev/null 2>&1; then
+        echo "Go not found - installing via apt..."
+        apt-get update -qq
+        apt-get install -y -qq golang-go
+    fi
 
-echo "Building..."
-go build -o "$BUILD_DIR/$BINARY_NAME" ./cmd/logserver
-install -m 755 "$BUILD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+    echo "Fetching source..."
+    git clone --quiet --depth 1 "$REPO_URL" "$BUILD_DIR/src"
+    cd "$BUILD_DIR/src"
 
-# --- 3. Detect what's on this machine ---
+    echo "Building..."
+    go build -o "$BUILD_DIR/$BINARY_NAME" ./cmd/logserver
+    install -m 755 "$BUILD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+    echo "Built and installed from source."
+fi
+
+# --- 4. Detect what's on this machine ---
 echo ""
 bold "Detected:"
 
@@ -74,7 +160,7 @@ else
     cross "Nginx"
 fi
 
-# --- 4. Set up user, directories, config ---
+# --- 5. Set up user, directories, config ---
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
@@ -93,9 +179,6 @@ if [ ! -f "$CONFIG_DIR/logserver.conf" ]; then
         echo "data = $DATA_DIR/data"
         echo "retention = 720h"
         echo "retention-check = 1h"
-        # Syslog is restricted to localhost by default - safe to enable
-        # unconditionally, since Docker/Apache/Nginx logs (if wired up)
-        # only ever originate from this same machine.
         echo "syslog-addr = :5514"
         echo "syslog-allow = 127.0.0.1/32"
     } > "$CONFIG_DIR/logserver.conf"
@@ -103,7 +186,7 @@ if [ ! -f "$CONFIG_DIR/logserver.conf" ]; then
     chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/logserver.conf"
 fi
 
-# --- 5. systemd unit ---
+# --- 6. systemd unit ---
 cat > /etc/systemd/system/homelab-tsdb.service << EOF
 [Unit]
 Description=homelab-tsdb log server
