@@ -15,7 +15,7 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
-    go build -trimpath -ldflags="-s -w" -o /out/homelab-tsdb-logserver .cmd/logseserver
+    go build -trimpath -ldflags="-s -w" -o /out/homelab-tsdb-logserver ./cmd/logserver
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
