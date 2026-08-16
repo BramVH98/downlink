@@ -1,0 +1,6 @@
+.git
+.github
+data/
+dist/
+*.md
+install.sh
