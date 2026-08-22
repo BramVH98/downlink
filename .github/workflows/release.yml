@@ -54,13 +54,13 @@ jobs:
           GOARM: ${{ matrix.goarm }}
         run: |
           mkdir -p dist
-          go build -o dist/homelab-tsdb-logserver-${{ matrix.suffix }} ./cmd/logserver
+          go build -o dist/downlink-${{ matrix.suffix }} ./cmd/logserver
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: homelab-tsdb-logserver-${{ matrix.suffix }}
-          path: dist/homelab-tsdb-logserver-${{ matrix.suffix }}
+          name: downlink-${{ matrix.suffix }}
+          path: dist/downlink-${{ matrix.suffix }}
 
   release:
     name: Create GitHub Release

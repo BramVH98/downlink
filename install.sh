@@ -11,10 +11,10 @@
 # failure, not a soft one.
 set -euo pipefail
 
-REPO="BramVH98/homelab-tsdb"
+REPO="BramVH98/downlink"
 REPO_URL="https://github.com/${REPO}.git"
 INSTALL_DIR="/usr/local/bin"
-BINARY_NAME="homelab-tsdb-logserver"
+BINARY_NAME="downlink"
 CONFIG_DIR="/etc/downlink"
 DATA_DIR="/var/lib/downlink"
 SERVICE_USER="downlink"

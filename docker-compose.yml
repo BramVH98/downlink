@@ -1,18 +1,20 @@
 services:
-  homelab-tsdb:
-  image: ghcr.io/bramvh98/homelab-tsdb:latest
-  container_name: homelab-tsdb
-  restart: unless-stopped
-  ports:
-    - "8080:8080"
-    - "5514:5514/udp"
-  volumes:
-    - homelab-tsdb-data:/data
-  command:
-    - "-data=/data"
-    - "-addr=:8080"
-    - "-syslog-addr=:5514"
-    - "-syslog-allow=172.16.0.0/12"
+  downlink:
+    image: ghcr.io/bramvh98/downlink:latest
+    container_name: downlink
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "5514:5514/udp"
+    volumes:
+      - downlink-data:/data
+    command:
+      - "-data=/data"
+      - "-addr=:8080"
+      - "-auth-user=admin"
+      - "-auth-pass=changeme"
+      - "-syslog-addr=:5514"
+      - "-syslog-allow=172.16.0.0/12"  # default Docker bridge network range - adjust to your actual network CIDR
 
 volumes:
-  homelab-tsdb-data:
+  downlink-data:
