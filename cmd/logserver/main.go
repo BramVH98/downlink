@@ -22,11 +22,11 @@ import (
 	"syscall"
 	"time"
 
-	"homelab-tsdb/internal/engine"
-	"homelab-tsdb/internal/storage"
-	"homelab-tsdb/internal/syslogrecv"
-	"homelab-tsdb/internal/tail"
-	"homelab-tsdb/internal/webui"
+	"downlink/internal/engine"
+	"downlink/internal/storage"
+	"downlink/internal/syslogrecv"
+	"downlink/internal/tail"
+	"downlink/internal/webui"
 )
 
 func main() {
@@ -130,7 +130,7 @@ func main() {
 		close(shutdownComplete)
 	}()
 
-	log.Printf("homelab-tsdb logserver listening on %s (data: %s, retention: %s)", *addr, *dataDir, *retention)
+	log.Printf("downlink logserver listening on %s (data: %s, retention: %s)", *addr, *dataDir, *retention)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}
@@ -231,7 +231,7 @@ func withAuth(adminUser, adminPass string, ingestTokens map[string]string, next 
 		userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(adminUser)) == 1
 		passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(adminPass)) == 1
 		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="homelab-tsdb"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="downlink"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

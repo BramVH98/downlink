@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"homelab-tsdb/internal/storage"
-	"homelab-tsdb/internal/wal"
+	"downlink/internal/storage"
+	"downlink/internal/wal"
 )
 
 type Engine struct {

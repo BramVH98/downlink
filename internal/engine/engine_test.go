@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"homelab-tsdb/internal/storage"
+	"downlink/internal/storage"
 )
 
 func TestWriteQuery_Logs(t *testing.T) {
