@@ -1,5 +1,5 @@
 markdown
-# homelab-tsdb
+# downlink
 
 A simple, self-hosted log (and metrics) server built from scratch in Go — no external database, no heavyweight dependencies. One binary, a write-ahead log for durability, and a web UI for browsing and live-tailing logs.
 
@@ -22,8 +22,8 @@ Built as a learning project and a genuinely useful tool for homelab setups: poin
 ## Quick start
 
 ```bash
-git clone https://github.com/BramVH98/homelab-tsdb.git
-cd homelab-tsdb
+git clone https://github.com/BramVH98/downlink.git
+cd downlink
 go build -o logserver ./cmd/logserver
 ./logserver -auth-user=admin -auth-pass=yourpassword
 ```
@@ -45,17 +45,17 @@ curl -u admin:yourpassword "localhost:8080/logs?field_gt=duration_ms:1000"
 ## Installing as a system service
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BramVH98/homelab-tsdb/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/BramVH98/downlink/main/install.sh | sudo bash
 ```
 
-This builds from source (installing Go via `apt` if needed), creates a dedicated `homelab-tsdb` system user, sets up a config file at `/etc/homelab-tsdb/logserver.conf` with a randomly generated admin password, installs a hardened systemd service, and detects Docker/Apache/Nginx on the machine — printing the exact config snippet to wire each one in.
+This builds from source (installing Go via `apt` if needed), creates a dedicated `downlink` system user, sets up a config file at `/etc/downlink/logserver.conf` with a randomly generated admin password, installs a hardened systemd service, and detects Docker/Apache/Nginx on the machine — printing the exact config snippet to wire each one in.
 
 Once installed:
 ```bash
-sudo systemctl start homelab-tsdb
-sudo systemctl stop homelab-tsdb
-sudo systemctl status homelab-tsdb
-journalctl -u homelab-tsdb -f
+sudo systemctl start downlink
+sudo systemctl stop downlink
+sudo systemctl status downlink
+journalctl -u downlink -f
 ```
 
 ## Architecture
@@ -141,12 +141,12 @@ Syslog over UDP has no authentication built into the protocol itself, so `-syslo
 ## Config file
 
 Instead of long command lines, settings can live in a file:
-/etc/homelab-tsdb/logserver.conf
+/etc/downlink/logserver.conf
 
 addr = :8080
 auth-user = admin
 auth-pass = supersecret
-data = /var/lib/homelab-tsdb/data
+data = /var/lib/downlink/data
 retention = 720h
 retention-check = 1h
 syslog-addr = :5514
@@ -154,7 +154,7 @@ syslog-allow = 127.0.0.1/32
 
 
 ```bash
-./logserver -config=/etc/homelab-tsdb/logserver.conf
+./logserver -config=/etc/downlink/logserver.conf
 ```
 
 Any flag also passed on the command line overrides the matching config file value — the file sets steady-state defaults, flags are for one-off overrides.
