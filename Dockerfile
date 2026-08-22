@@ -15,16 +15,16 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
-    go build -trimpath -ldflags="-s -w" -o /out/homelab-tsdb-logserver ./cmd/logserver
+    go build -trimpath -ldflags="-s -w" -o /out/downlink ./cmd/logserver
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/homelab-tsdb-logserver /usr/local/bin/homelab-tsdb-logserver
+COPY --from=builder /out/downlink /usr/local/bin/downlink
 
 VOLUME ["/data"]
 
 EXPOSE 8080
 EXPOSE 5514/udp
 
-ENTRYPOINT ["/usr/local/bin/homelab-tsdb-logserver"]
+ENTRYPOINT ["/usr/local/bin/downlink"]
 CMD ["-data=/data", "-addr=:8080"]
