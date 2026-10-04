@@ -216,7 +216,7 @@ func (e *Engine) QueryLogs(q storage.LogQuery, limit, offset int) []storage.LogE
 		merged = merged[offset:]
 	}
 	if limit > 0 && len(merged) > limit {
-		merged = merged[offset:]
+		merged = merged[:limit]
 	}
 	return merged
 }

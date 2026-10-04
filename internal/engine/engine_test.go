@@ -346,3 +346,30 @@ func countFiles(t *testing.T, dir string) int {
 	}
 	return len(entries)
 }
+
+func TestQueryLogs_RespectsLimitAndOffset(t *testing.T) {
+	dir := t.TempDir()
+	e, err := Open(dir, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	for i := 1; i <= 10; i++ {
+		if _, err := e.WriteLog(storage.LogEntry{Source: "s", Level: "info", Message: "m", Timestamp: int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := e.QueryLogs(storage.LogQuery{}, 3, 0); len(got) != 3 {
+		t.Errorf("limit=3 offset=0: got %d results, want 3", len(got))
+	}
+
+	got := e.QueryLogs(storage.LogQuery{}, 3, 2)
+	if len(got) != 3 {
+		t.Fatalf("limit=3 offset=2: got %d results, want 3", len(got))
+	}
+	if got[0].Timestamp != 8 {
+		t.Errorf("first result timestamp = %d, want 8 (newest-first, skipping 10 and 9)", got[0].Timestamp)
+	}
+}
